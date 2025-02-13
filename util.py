@@ -1,11 +1,10 @@
 from curses import start_color
+from statistics import variance
 import pandas as pd
 import os
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pywt
-from torch import normal
-
 
 def read_files(filenames: list):
     return pd.concat([pd.read_csv(f'./data/{filename}') for filename in filenames])
@@ -90,8 +89,10 @@ def categorize_port(port):
         return 'dynamic'
     else:
         return 'unknown'  # Other/unknown ports
-    
-def resample(df, freq='1s'):
+
+from scipy.stats import entropy
+
+def resample(df, freq='500ms'):
     """
     Resample the dataframe to a given frequency
     
@@ -110,11 +111,10 @@ def resample(df, freq='1s'):
     df = df.assign(src_port_category=lambda x: x['src_port'].apply(categorize_port))
 
     df = df.assign(src_internal_ip_count=lambda x: x['src_ip'].str.contains('192.168').astype(int))
-    df['dst_host_port_from_internal'] = np.where(
-        df['src_ip'].str.startswith('192.168'),  # Condition
-        df['dst_ip'].astype(str) + ':' + df['dst_port'].astype(str),  # If True
-        np.nan  # If False
-    )
+    df = df.assign(fwd_total_payload_bytes_rolling_variance = lambda x: x['fwd_total_payload_bytes'].rolling(window=40).var())
+    df = df.assign(bwd_rst_flag_ratio = lambda x: (x['bwd_rst_flag_counts'] + 0.001) / (x['bwd_ack_flag_counts'] + 0.001))
+    df = df.assign(dst_host_port = lambda x: x['dst_ip'] + x['dst_port'].astype(str))
+
 
     df = pd.get_dummies(df, columns=['dst_port_category', 'src_port_category'])
 
@@ -129,7 +129,7 @@ def resample(df, freq='1s'):
         # "dst_host_port_from_internal": lambda x: len(np.unique(x.dropna())) / (len(x) + 1),
 
         # "dst_port": "nunique",
-        # "dst_host_port": "nunique",
+        "dst_host_port": "nunique",
 
         
         # "fwd_payload_bytes_max": "max",
@@ -148,9 +148,12 @@ def resample(df, freq='1s'):
         # "total_header_bytes": "sum",
         # "total_payload_bytes": "sum",
 
-        # "payload_bytes_std": lambda x: 1 / (np.mean(x) ** 2 + 0.00000001),
+        "payload_bytes_std": lambda x: 1 / (np.mean(x) ** 2 + 0.00000001),
 
-        "fwd_total_payload_bytes": lambda x: 1 / (np.std(x) + 0.00000001),
+        # if x does not contains nan
+        # "fwd_total_payload_bytes_rolling_variance": lambda x: 1 / (np.mean(x) + 0.001) if np.all(~np.isnan(x)) else 0,
+        # "fwd_total_payload_bytes": lambda x: (1 / (np.var(x) + 1e-9)) if np.count_nonzero(x) == len(x) else 0,
+        # "avg_segment_size": lambda x: (1 / (np.var(x) + 1e-9)) if np.count_nonzero(x) == len(x) else 0,
         
         # "active_mean": "mean",
         # "idle_mean": "mean",
@@ -169,12 +172,15 @@ def resample(df, freq='1s'):
         # "ack_flag_counts": "sum",
         # "bwd_fin_flag_counts": "sum",
         "dst_port_category_web": "sum",
-        # "bwd_rst_flag_counts": "sum",
+        # "bwd_rst_flag_ratio": "mean",
+
+        # 'packets_IAT_mean': 'mean',
 
         # "fwd_packets_IAT_total": "sum",
 
         # "payload_bytes_variance": "sum",
 
+        "syn_flag_counts": "sum",
         # "fin_flag_counts": "sum",
         # "rst_flag_counts": "sum",
 
@@ -190,10 +196,7 @@ def resample(df, freq='1s'):
         # "dst_port_category_registered": "sum",
         # "dst_port_category_remote_access": "sum",
         # "dst_port_category_well_known": "sum", 
-    }).interpolate('time'), df['label'].resample(freq).agg(lambda x: 1 if x.eq("Benign").all() else -1)
-
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.decomposition import PCA
+    }).interpolate('zero'), df['label'].resample(freq).agg(lambda x: 1 if x.eq("Benign").all() else -1)
 
 def preprocess(traffic_df, scaler, all=False):
     normal_internal = traffic_df
@@ -205,25 +208,40 @@ def preprocess(traffic_df, scaler, all=False):
 
     normal_internal_resampled = pd.DataFrame(scaler(normal_internal_resampled), columns=normal_internal_resampled.columns)
 
-    reduced_df = remove_background(normal_internal_resampled, rank=1)
-    normal_internal_resampled = pd.DataFrame(reduced_df, columns=normal_internal_resampled.columns)
+    print(normal_internal_resampled)
+
+    # reduced_df = remove_background(normal_internal_resampled, rank=1)
+    # normal_internal_resampled = pd.DataFrame(reduced_df, columns=normal_internal_resampled.columns)
 
     if len(normal_internal_resampled) % 2 != 0:
         normal_internal_resampled = normal_internal_resampled[:-1]
         normal_internal_resampled_labeled = normal_internal_resampled_labeled[:-1]
+
         
-    swt_coef = pywt.swtn(normal_internal_resampled, wavelet='db38', level=1, norm=True)[0]
-    swt_df = pd.DataFrame(swt_coef['ad'][:, 1], columns=['ddos_loit'])
+    swt_coef = pywt.swtn(normal_internal_resampled, wavelet='db2', level=2, norm=True)
+        
+    # swt1_coef = pywt.swt(normal_internal_resampled['dst_port_category_web'].values, wavelet='db8', level=2, norm=True)
+    # swt2_coef = pywt.swt(normal_internal_resampled['dst_port'].values, wavelet='db8', level=2, norm=True)
+    # swt3_coef = pywt.swt(normal_internal_resampled['fwd_total_payload_bytes_rolling_variance'].values, wavelet='db8', level=2, norm=True)
+    # swt4_coef = pywt.swt(normal_internal_resampled['bwd_rst_flag_counts'].values, wavelet='db8', level=2, norm=True)
+    # swt5_coef = pywt.swt(normal_internal_resampled['dst_port_category_web'].values, wavelet='db8', level=2, norm=True)
 
-    
-    # dos_approx, (dos_h, dos_v, dos_d) = pywt.swt2(normal_internal_resampled[['dst_port_category_web', 'fwd_total_payload_bytes']].values, 'coif17', level=1, start_level=0, norm=True, trim_approx=True)
-    # port_approx, (port_h, port_v, port_d) = pywt.swt2(normal_internal_resampled[['dst_port', 'bwd_rst_flag_counts']].values, 'coif17', level=1, start_level=0, norm=True, trim_approx=True)
-    # # botnet_approx, (botnet_h, botnet_v, botnet_d) = pywt.swt2(normal_internal_resampled[['dst_host_port_from_internal', 'payload_bytes_std']].values, 'coif17', level=1, start_level=0, norm=True, trim_approx=True)
+    # print(np.array(swt_coef[1]).T)
+    # coefs = np.array(swt_coef[0], swt2_coef[1])
 
+    # coefs1 = np.array(swt1_coef[1][0])
+    # coefs2 = np.array(swt2_coef[1][0])
+    # coefs3 = np.array(swt3_coef[1][0])
+    # coefs4 = np.array(swt4_coef[1][0])
+    # coefs5 = np.array(swt5_coef[1][0])
 
-    # swt = np.array((dos_d[:, 0])).T
-    
-    # swt_df = pd.DataFrame(swt, columns=["ddos_loit"])
+    # coefs = np.row_stack((coefs1, coefs2, coefs3, coefs4)).T
 
+    swt_df = pd.DataFrame(swt_coef[1]['aa'], columns=[
+        'dst_port_category_web_approx',
+        'dst_port_approx',
+        'fwd_total_payload_bytes_approx',
+        'bwd_rst_flag_counts_approx', 
+    ])
 
     return swt_df, normal_internal_resampled_labeled
